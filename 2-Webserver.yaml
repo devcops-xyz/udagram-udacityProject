@@ -1,0 +1,343 @@
+Description: "A CloudFormation template, that copies a zipped web app from S3 Bucket and deploy it multi AZ.
+It creates also an Application Load Balancer & Auto Scaling Group."
+Parameters:
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names.
+    Type: String
+  Ami:
+    Description: 
+      "To find  the latest Ubuntu 18.04 AMI ID using aws cli:
+      aws --region us-west-2 ec2 describe-images \
+      --owners 099720109477 \
+      --filters 'Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-bionic-18.04-amd64-server-????????' 'Name=state,Values=available' \
+      --query 'reverse(sort_by(Images, &CreationDate))[:1].ImageId' \
+      --output text"
+    Type: AWS::EC2::Image::Id
+    Default: ami-06ffade19910cbfc0
+  KeyName:
+    Description: Provides the name of the EC2 key pair.
+    Type: String
+  InstanceType:
+    Description: WebServer EC2 instance type.
+    Type: String
+    Default: t3a.medium
+    AllowedValues:
+    - a1.large
+    - t3.medium
+    - t3a.medium
+    - t2.medium
+    - c5.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  RemoteAccessCIDR:
+    ConstraintDescription: must be in the form x.x.x.x/x.
+    Description: Allowed CIDR block for external SSH access to the bastion.
+    Type: String
+Resources:
+##################### SecurityGroup #####################
+  ASGSecurityGroup:
+      Type: 'AWS::EC2::SecurityGroup'
+      Properties:
+        GroupDescription: Security group of the auto scaling group
+        VpcId: !ImportValue VpcID
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            SourceSecurityGroupId: !Ref LBSecurityGroup
+        SecurityGroupEgress:
+          - IpProtocol: tcp
+            FromPort: 0
+            ToPort: 65535
+            CidrIp: 0.0.0.0/0
+        Tags:
+          - Key: Name
+            Value: !Ref EnvironmentName
+
+  LBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group of the load balancer
+      VpcId: !ImportValue VpcID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  BastionSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enables SSH Access to Bastion Hosts
+      VpcId: !ImportValue VpcID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref RemoteAccessCIDR
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref RemoteAccessCIDR
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+##################### IAM & InstanceProfile #####################
+  Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com" 
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: [
+                  "s3:Get*",
+                  "s3:List*",
+                  "s3:Read*"
+                ]
+                Resource: arn:aws:s3:::udacity-demo-khaled
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} S3 IAM Role
+  
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref "Role"
+
+################# LoadBalancer, Listener & TargetGroup  ###################
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      SecurityGroups:
+        - !Ref LBSecurityGroup
+      Subnets: 
+        - !ImportValue PublicSubnet1
+        - !ImportValue PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} LoadBalancer
+
+  Listener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  TargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: !ImportValue VpcID
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} TargetGroup
+################# AutoScaling & LaunchConfiguration ###################
+  WebServerAutoScaling:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1
+        - !ImportValue PrivateSubnet2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: '4'
+      MaxSize: '5'
+      TargetGroupARNs:
+        - !Ref TargetGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  LaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          udagram_install:
+            - install_cfn
+            - install_udagram
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [main]
+                  - stack=
+                  - !Ref 'AWS::StackId'
+                  - |+
+
+                  - region=
+                  - !Ref 'AWS::Region'
+                  - |+
+
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [cfn-auto-reloader-hook]
+                  - |
+                    triggers=post.update
+                  - >
+                    path=Resources.LaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                  - 'action=/usr/local/bin/cfn-init -v '
+                  - '         --stack '
+                  - !Ref 'AWS::StackName'
+                  - '         --resource LaunchConfiguration '
+                  - '         --configsets udagram_install '
+                  - '         --region '
+                  - !Ref 'AWS::Region'
+                  - |+
+
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        install_udagram:
+          packages:
+            apt:
+              apache2: []
+          files:
+            /tmp/create-udagram:
+              content: !Join
+                  - ''
+                  - - |
+                      #!/usr/bin/env bash
+                    - >
+                      apt-get update -y
+                    - |
+                      apt-get install unzip awscli -y
+                    - |
+                      cd /var/www/html
+                    - |
+                      aws s3 cp s3://udacity-demo-khaled/udacity.zip .
+                    - |
+                      unzip -o udacity.zip
+                    - |
+                      mv udacity/* .
+                    - |+
+
+              mode: '000500'
+              owner: root
+              group: root
+          commands:
+            01_configure_udahram:
+              command: /tmp/create-udagram
+              cwd: /var/www/html
+          services:
+            sysvinit:
+              apache2:
+                enabled: 'true'
+                ensureRunning: 'true'
+    Properties:
+      ImageId: !Ref Ami
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeType: "gp2"
+            VolumeSize: 10
+      SecurityGroups:
+        - !Ref ASGSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !Ref KeyName
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash -xe
+            - >
+              sudo apt-get update -y
+            - |
+              sudo apt-get install -y python-pip
+            - |
+              sudo pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+            - |
+              sudo cp /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup 
+            - |
+              sudo systemctl daemon-reload  
+            - |
+              sudo chmod +x /etc/init.d/cfn-hup 
+            - |
+              sudo update-rc.d cfn-hup defaults  
+            - |
+              sudo update-rc.d cfn-hup enable
+            - |
+
+            - '/usr/local/bin/cfn-init -v '
+            - '         --stack '
+            - !Ref 'AWS::StackName'
+            - '         --resource LaunchConfiguration '
+            - '         --configsets udagram_install '
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+            - '/usr/local/bin/cfn-signal -e $? '
+            - '         --stack '
+            - !Ref 'AWS::StackName'
+            - '         --resource WebServerAutoScaling '
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+Outputs:
+  WebsiteURL:
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - LoadBalancer
+          - DNSName
+    Description: Udagram Website

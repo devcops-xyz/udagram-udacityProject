@@ -12,3 +12,4 @@ Default routes for the NATs in the private subnets."
 
 "A CloudFormation template, that copies a zipped web app from S3 Bucket and deploy it multi AZ.
 It creates also an Application Load Balancer & Auto Scaling Group."
+
